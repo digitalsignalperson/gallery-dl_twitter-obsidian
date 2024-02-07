@@ -65,67 +65,226 @@ class TwitterExtractor(Extractor):
         self.api = TwitterAPI(self)
         metadata = self.metadata()
 
-        if self.config("expand"):
-            tweets = self._expand_tweets(self.tweets())
-            self.tweets = lambda : tweets
+        # I'm just using this branch for bookmarks and will not worry about the other cases for now
+        self.log.debug("Starting processing bookmarks")
 
-        if self.config("unique", True):
-            seen_tweets = set()
-        else:
-            seen_tweets = None
+        self.processed_tweets = set()  # Dump json for all tweets, but only download media once
 
-        for tweet in self.tweets():
+        def make_info(tweet, favorite_number, favorite_index, favorite_cid, quoted=0, expanded=0):
+            obj = tweet["legacy"] if "legacy" in tweet else tweet
+            tid = obj['id_str']
+            info = {}
+            info['_favorite_number'] = favorite_number
+            info['_favorite_index'] = favorite_index
+            info['_favorite_quoted'] = quoted
+            info['_favorite_expanded'] = expanded
+            info['_favorite_cid'] = favorite_cid
+            
+            info['_filename'] = f'{favorite_number:06}_{favorite_index:06}_{quoted}_{expanded}_{tid}_{cid}'
+            
+            # Use private=true in pp. Example:
+            #
+            #     "postprocessors": [{
+            #         "name": "metadata",
+            #         "event": "post",
+            #         "directory": "metadata",
+            #         "mode": "json",
+            #         "private": "true",
+            #         "filename": "{_filename|tweet_id}.json"
+            #     }],
+            
+            return info
+        
+        self.dump_index = 0
+        def dump_raw(tweet):
+            # This is quick and dirty, but useful for debugging and might as well save this for archival purposes
+            self.log.debug(f"dumping into raw.json data {self.dump_index}")
+            with open('raw.json', 'a') as f:
+                json.dump([tweet], f, ensure_ascii=False, indent=4)
+                # later replace "\n][\n" with ",\n"
+            self.dump_index += 1
 
-            if "legacy" in tweet:
-                data = tweet["legacy"]
-            else:
-                data = tweet
+        def dump_raw_fixup():
+            with open('raw.json', 'r') as f:
+                datas = f.read()
+            data = json.loads(datas.replace("\n][\n", ",\n"))
+            with open('raw.json', 'w') as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
 
-            if not self.retweets and "retweeted_status_id_str" in data:
-                self.log.debug("Skipping %s (retweet)", data["id_str"])
-                continue
-            if not self.quoted and "quoted_by_id_str" in data:
-                self.log.debug("Skipping %s (quoted tweet)", data["id_str"])
-                continue
-            if "in_reply_to_user_id_str" in data and (
-                not self.replies or (
-                    self.replies == "self" and
-                    data["user_id_str"] !=
-                    (self._user_obj["rest_id"] if self._user else
-                     data["in_reply_to_user_id_str"])
-                )
-            ):
-                self.log.debug("Skipping %s (reply)", data["id_str"])
-                continue
 
-            if seen_tweets is not None:
-                if data["id_str"] in seen_tweets:
-                    self.log.debug(
-                        "Skipping %s (previously seen)", data["id_str"])
+        try:
+            for favorite_number, tweet in enumerate(self.tweets()):
+                dump_raw(tweet)
+
+                favorite_index = 0
+
+                obj = tweet["legacy"] if "legacy" in tweet else tweet
+                cid = obj.get("conversation_id_str")  # the original conversation id
+                tuid = obj['user_id_str']  # the user id of the favorited tweet - it might not be the author of the conversation
+                tid = obj['id_str']  # tweet id
+
+                info = make_info(tweet, favorite_number, favorite_index, cid, quoted=0, expanded=0)
+                yield from self._process_tweet(tweet, info)
+                self.log.debug(f"filename:{info['_filename']}")
+                
+                # Always yield any quoted tweet in the main tweet
+                quoted = self._extract_quoted(tweet)
+                if quoted:
+                    dump_raw(quoted)
+
+                    info = make_info(quoted, favorite_number, favorite_index, cid, quoted=1, expanded=0)
+                    yield from self._process_tweet(quoted, info)
+                    self.log.debug(f"filename:{info['_filename']}")
+
+                favorite_index += 1
+
+                if favorite_number < 290:
+                    self.log.debug(f"skipping {favorite_number=}")
                     continue
-                seen_tweets.add(data["id_str"])
 
-            files = []
-            if "extended_entities" in data:
-                self._extract_media(
-                    data, data["extended_entities"]["media"], files)
-            if "card" in tweet and self.cards:
-                self._extract_card(tweet, files)
-            if self.twitpic:
-                self._extract_twitpic(data, files)
-            if not files and not self.textonly:
-                continue
+                if self.config('expand') and cid:
+                    expanded_tweets = self.api.tweet_detail(cid)
+                    conversation_author = None
+                    total_skipped = 0
+                    consecutive_skipped = 0
+                    skipped_thresh = 5
+                    for expanded_number, etweet in enumerate(expanded_tweets):
+                        dump_raw(etweet)
 
-            tdata = self._transform_tweet(tweet)
-            tdata.update(metadata)
-            tdata["count"] = len(files)
-            yield Message.Directory, tdata
+                        eobj = etweet["legacy"] if "legacy" in etweet else etweet
+                        ecid = eobj.get("conversation_id_str")
+                        euid = eobj['user_id_str']
+                        etid = eobj['id_str']
+
+                        reply_to_tid = eobj.get("in_reply_to_status_id_str")
+                        reply_to_uid = eobj.get("in_reply_to_user_id_str")
+                        
+                        # Check if we shall keep this tweet
+
+                        # Conditions to yield expanded tweets:
+                        #   - conversation id matches (not an advertisement)
+                        #   - tweets written by author of conversation replying to themself
+                        # Break when:
+                        #   - non-author replies to thread (unless it's the favorited tweet)
+                        #   - author replies to someone else (unless it's the favorited tweet)
+                        #   - more than N tweets are not part of the chain
+
+                        skip = False
+                        if etid == cid:  # should also be expanded_number == 0, but doing the former to be robust?
+                            # always keep the convo start, and set the conversation_author
+                            conversation_author = euid
+                        elif ecid != cid:
+                            # often these are ads
+                            skip = True
+                            etdata = self._transform_tweet(etweet)
+                            euname = etdata['user']['name']
+                            self.log.debug(f"Skipping likely advertisement {etid} {euname}")
+                        elif expanded_number > 0 and (reply_to_tid is None or reply_to_uid is None): # but if the first one isn't the root then does this make sense?
+                            # we need the reply fields
+                            skip = True
+                            self.log.debug(f"Skipping missing reply fields {etid}")
+                        elif etid == tid:
+                            # keep the tweet that was originally favorited
+                            pass
+                        elif reply_to_tid == tid and euid == conversation_author:
+                            # keep tweet of conversation author replying to tweet that was favorited
+                            pass
+                        elif euid != conversation_author:
+                            # otherwise if the author is not the conversation author, skip
+                            self.log.debug(f"Skipping non-author reply {etid}")
+                            skip = True
+                        elif euid == conversation_author and reply_to_uid == euid and consecutive_skipped == 0:
+                            # this is the main thing we keep
+                            # the conversation author replying to themself in a chain
+                            pass
+                        elif euid == conversation_author and reply_to_uid == euid and consecutive_skipped > 0:
+                            self.log.debug(f"Skipping author reply to themself that is not consecutive in the list {etid} {consecutive_skipped=}")
+                            skip = True
+                        else:
+                            # otherwise discard the rest.
+                            skip = True
+                            self.log.debug(f"Skipping for unknown reason {etid}")
+                        
+                        if skip:
+                            consecutive_skipped += 1
+                            total_skipped += 1
+                            if total_skipped >= skipped_thresh:
+                                # Stop requesting paginated tweets here
+                                # pagination count reduced to 10 to avoid downloading hundreds of useless replies
+                                self.log.debug(f"stopping expansion after {total_skipped=} {consecutive_skipped=}")
+                                break
+                            else:
+                                continue
+                        
+                        info = make_info(etweet, favorite_number, favorite_index, cid, quoted=0, expanded=1)
+                        yield from self._process_tweet(etweet, info)
+                        self.log.debug(f"filename:{info['_filename']}")
+
+                        consecutive_skipped = 0
+
+                        # Yield any quote tweet that was included
+                        equoted = self._extract_quoted(etweet)
+                        if equoted:
+                            dump_raw(equoted)
+
+                            info = make_info(equoted, favorite_number, favorite_index, cid, quoted=1, expanded=1)
+                            yield from self._process_tweet(equoted, info)
+                            self.log.debug(f"filename:{info['_filename']}")
+
+                        favorite_index += 1
+        
+                # # REMOVE AFTER TESTING
+                # if favorite_number >= 9:
+                #     break
+        except KeyboardInterrupt:
+            raise
+        finally:
+            if self.dump_index > 0:
+                dump_raw_fixup() # good to save this until after in case you Ctrl+C the program and want the intermediate data
+
+    def _process_tweet(self, tweet, extra_data):
+        if "legacy" in tweet:
+            data = tweet["legacy"]
+        else:
+            data = tweet
+
+        files = []
+        if "extended_entities" in data:
+            self._extract_media(
+                data, data["extended_entities"]["media"], files)
+        if "card" in tweet and self.cards:
+            self._extract_card(tweet, files)
+        if self.twitpic:
+            self._extract_twitpic(data, files)
+
+        tdata = self._transform_tweet(tweet)
+        tdata.update(self.metadata())
+        tdata.update(extra_data)
+        tdata["count"] = len(files)
+        yield Message.Directory, tdata
+
+        tid = data['id_str']
+        if tid in self.processed_tweets:
+            self.log.debug(f"skipping urls (already processed) {tid}")
+        else:
+            self.processed_tweets.add(tid)
             for tdata["num"], file in enumerate(files, 1):
                 file.update(tdata)
                 url = file.pop("url")
                 if "extension" not in file:
                     text.nameext_from_url(url, file)
                 yield Message.Url, url, file
+
+    def _extract_quoted(self, tweet):
+        if "quoted_status_result" in tweet:
+            try:
+                quoted = tweet["quoted_status_result"]["result"]
+                quoted["legacy"]["quoted_by"] = tweet["core"]["user_results"]["result"]["legacy"]["screen_name"]
+                quoted["legacy"]["quoted_by_id_str"] = tweet["rest_id"]
+                return quoted
+            except KeyError:
+                self.log.debug("Skipping quote of %s (deleted)", quoted.get("rest_id"))
+        return None
 
     def _extract_media(self, tweet, entities, files):
         for media in entities:
@@ -270,6 +429,7 @@ class TwitterExtractor(Extractor):
             "quote_count"   : tget("quote_count"),
             "reply_count"   : tget("reply_count"),
             "retweet_count" : tget("retweet_count"),
+            "conversation_id" : tget("conversation_id_str"),
         }
 
         hashtags = entities.get("hashtags")
@@ -353,23 +513,67 @@ class TwitterExtractor(Extractor):
         self._user = self._transform_user(user)
 
     def _users_result(self, users):
-        userfmt = self.config("users")
-        if not userfmt or userfmt == "timeline":
-            cls = TwitterTimelineExtractor
-            fmt = (self.root + "/i/user/{rest_id}").format_map
-        elif userfmt == "media":
-            cls = TwitterMediaExtractor
-            fmt = (self.root + "/id:{rest_id}/media").format_map
-        elif userfmt == "tweets":
-            cls = TwitterTweetsExtractor
-            fmt = (self.root + "/id:{rest_id}/tweets").format_map
-        else:
-            cls = None
-            fmt = userfmt.format_map
+        self._user = self._user_obj = None
 
         for user in users:
-            user["_extractor"] = cls
-            yield Message.Queue, fmt(user), user
+            tweet = {
+                "id_str": "0",
+                "user" : user,
+                "lang" : None,
+                "entities" : {},
+                'created_at' : user['legacy']['created_at'],
+            }
+            
+            tdata = self._transform_tweet(tweet)
+            tdata.update(self.metadata())
+            yield Message.Directory, tdata
+            
+            screen_name = user['legacy']['screen_name']
+
+            try:
+                url = user["legacy"]["profile_image_url_https"]
+                if url == ("https://abs.twimg.com/sticky"
+                   "/default_profile_images/default_profile_normal.png"):
+                   raise ValueError()
+                url = url.replace("_normal.", ".")
+                id_str = url.rsplit("/", 2)[1]
+                timestamp = ((int(id_str) >> 22) + 1288834974657) // 1000
+                tweet = self._make_tweet(user, "1", url, timestamp)
+                tdata = self._transform_tweet(tweet)
+                tdata.update(self.metadata())
+                text.nameext_from_url(url, tdata)
+                yield Message.Url, url, tdata
+            except (KeyError, ValueError):
+                self.log.debug(f"user {screen_name} has no profile image")
+
+            try:
+                url = user["legacy"]["profile_banner_url"]
+                _, timestamp = url.rsplit("/", 1)
+                tweet = self._make_tweet(user, "2", url, timestamp)
+                tdata = self._transform_tweet(tweet)
+                tdata.update(self.metadata())
+                text.nameext_from_url(url, tdata)
+                yield Message.Url, url, tdata
+            except (KeyError, ValueError):
+                self.log.debug(f"user {screen_name} has no profile banner")
+
+        # userfmt = self.config("users")
+        # if not userfmt or userfmt == "timeline":
+        #     cls = TwitterTimelineExtractor
+        #     fmt = (self.root + "/i/user/{rest_id}").format_map
+        # elif userfmt == "media":
+        #     cls = TwitterMediaExtractor
+        #     fmt = (self.root + "/id:{rest_id}/media").format_map
+        # elif userfmt == "tweets":
+        #     cls = TwitterTweetsExtractor
+        #     fmt = (self.root + "/id:{rest_id}/tweets").format_map
+        # else:
+        #     cls = None
+        #     fmt = userfmt.format_map
+
+        # for user in users:
+        #     user["_extractor"] = cls
+        #     yield Message.Queue, fmt(user), user
 
     def _expand_tweets(self, tweets):
         seen = set()
@@ -1046,6 +1250,7 @@ class TwitterAPI():
             "withCommunity": True,
             "withQuickPromoteEligibilityTweetFields": True,
             "withBirdwatchNotes": False,
+            "count": 10, # expanding conversation, median length small and we'll stop early
         }
         return self._pagination_tweets(
             endpoint, variables, ("threaded_conversation_with_injections",))
@@ -1087,7 +1292,7 @@ class TwitterAPI():
     def user_bookmarks(self):
         endpoint = "/graphql/uKP9v_I31k0_VSBmlpq2Xg/Bookmarks"
         variables = {
-            "count": 100,
+            "count": 100, # reduce for debugging only REMOVE AFTER TESTING
         }
         return self._pagination_tweets(
             endpoint, variables, ("bookmark_timeline", "timeline"), False)
@@ -1462,20 +1667,6 @@ class TwitterAPI():
                             pass
 
                 yield tweet
-
-                if "quoted_status_result" in tweet:
-                    try:
-                        quoted = tweet["quoted_status_result"]["result"]
-                        quoted["legacy"]["quoted_by"] = (
-                            tweet["core"]["user_results"]["result"]
-                            ["legacy"]["screen_name"])
-                        quoted["legacy"]["quoted_by_id_str"] = tweet["rest_id"]
-                        yield quoted
-                    except KeyError:
-                        extr.log.debug(
-                            "Skipping quote of %s (deleted)",
-                            tweet.get("rest_id"))
-                        continue
 
             if stop_tweets and not tweet:
                 return
