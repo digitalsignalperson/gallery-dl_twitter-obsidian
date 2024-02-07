@@ -1,3 +1,16 @@
+
+# About this (probably broken) fork
+- Last used around 2023-02
+- mods to `gallery_dl/extractor/twitter.py`` to save all bookmarks
+- `twitter-obsidian.py` to generate an obsidian vault
+- misc debugging code in `twitter-obsidian-debugging.py` 
+
+Notes I shared in an obsidian forum post:
+https://forum.obsidian.md/t/twitter-favorites-as-an-obsidian-brain-with-graphs-and-canvases/54342
+
+
+------------------------
+
 ==========
 gallery-dl
 ==========
